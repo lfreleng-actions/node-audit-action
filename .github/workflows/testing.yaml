@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -20,26 +20,26 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Test audit behaviour against the synthetic fixture ###
+  test-synthetic:
+    name: "Test: synthetic fixture (test-node-project)"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 15
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
       # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
+      - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -50,41 +50,514 @@ jobs:
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+      - name: "Checkout test project: lfreleng-actions/test-node-project"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: lfreleng-actions/test-node-project
+          ref: 89cc7f156c88afa1855087b00ac0dce886e7b0f3
+          path: test-project
+          persist-credentials: false
 
-      - name: "Running local action: ${{ github.repository }}"
+      - name: "Running local action: default audit"
+        id: default-audit
         uses: ./
         with:
-          input: "test input 💬"
+          path_prefix: test-project
+          permit_fail: 'true'
+          output_directory: audit-default
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Running local action: production dependencies only"
+        id: production-audit
+        uses: ./
+        with:
+          path_prefix: test-project
+          permit_fail: 'true'
+          production_only: 'true'
+          output_directory: audit-production
+
+      - name: "Verify audit outputs and report validity"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          DEFAULT_PASSED: ${{ steps.default-audit.outputs.audit_passed }}
+          # yamllint disable-line rule:line-length
+          DEFAULT_COUNT: ${{ steps.default-audit.outputs.vulnerability_count }}
+          DEFAULT_REPORT: ${{ steps.default-audit.outputs.report_path }}
+          PROD_REPORT: ${{ steps.production-audit.outputs.report_path }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Verify audit outputs and production scoping
+          errors=0
+          if [ ! -f "${DEFAULT_REPORT}" ]; then
+            echo "Audit report not found: ${DEFAULT_REPORT} ❌"
+            errors=1
+          fi
+          case "${DEFAULT_REPORT}" in
+            */audit-default/npm-audit-report.json) ;;
+            *)
+              echo "Report placement not honoured: ${DEFAULT_REPORT} ❌"
+              errors=1 ;;
+          esac
+          case "${DEFAULT_PASSED}" in
+            true|false) ;;
+            *)
+              echo "audit_passed not a boolean: ${DEFAULT_PASSED} ❌"
+              errors=1 ;;
+          esac
+          case "${DEFAULT_COUNT}" in
+            ''|*[!0-9]*)
+              echo "vulnerability_count not numeric: ${DEFAULT_COUNT} ❌"
+              errors=1 ;;
+          esac
+          # The audit_passed output must agree with the report: the
+          # default threshold is 'high', so high + critical counts
+          # decide the outcome
+          report_at_or_above="$(jq '
+            (.metadata.vulnerabilities.high // 0)
+            + (.metadata.vulnerabilities.critical // 0)' \
+            "${DEFAULT_REPORT}")"
+          if [ "${report_at_or_above}" = "0" ]; then
+            expected_passed="true"
+          else
+            expected_passed="false"
+          fi
+          if [ "${DEFAULT_PASSED}" != "${expected_passed}" ]; then
+            echo "audit_passed disagrees with the report ❌"
+            echo "Output: ${DEFAULT_PASSED}"
+            echo "Expected: ${expected_passed}"
+            errors=1
+          fi
+          # Production scoping: both reports must carry the audit
+          # metadata; npm reports the same lockfile inventory in
+          # metadata.dependencies regardless of scoping, so the
+          # advisory-filtering semantics of production_only get
+          # asserted deterministically in the failure-semantics job
+          # with a fixture that has a dev-only vulnerable package
+          if ! jq -e \
+            '.metadata.vulnerabilities | type == "object"' \
+            "${PROD_REPORT}" > /dev/null 2>&1; then
+            echo "Production-scoped report invalid ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Synthetic fixture tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Synthetic fixture verified ✅"
+          echo "Synthetic fixture verified ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test the real downstream fixture without a lockfile ###
+  test-onap:
+    name: "Test: real fixture (onap/sdc-onap-ui-common)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          invalid_input: "Some garbage"
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # The fixture has no lockfile, no engines field and no .nvmrc,
+      # so it exercises the lockfile synthesis path and requires an
+      # explicit Node.js version
+      - name: "Checkout test project: onap/sdc-onap-ui-common"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: onap/sdc-onap-ui-common
+          ref: c305ee4240e368dd0b2238a4f39881a97bad6746
+          path: test-project
+          persist-credentials: false
+
+      - name: "Running local action: low threshold"
+        id: low-audit
+        uses: ./
+        with:
+          path_prefix: test-project
+          node_version: '22'
+          audit_level: low
+          permit_fail: 'true'
+          output_directory: audit-low
+
+      # A 'critical' threshold on the same project verifies the
+      # threshold evaluation independently of the fixture's exact
+      # vulnerability profile
+      - name: "Running local action: critical threshold"
+        id: critical-audit
+        uses: ./
+        with:
+          path_prefix: test-project
+          node_version: '22'
+          audit_level: critical
+          permit_fail: 'true'
+          output_directory: audit-critical
+
+      - name: "Verify lockfile synthesis and threshold behaviour"
+        shell: bash
+        env:
+          LOW_PASSED: ${{ steps.low-audit.outputs.audit_passed }}
+          LOW_COUNT: ${{ steps.low-audit.outputs.vulnerability_count }}
+          LOW_REPORT: ${{ steps.low-audit.outputs.report_path }}
+          CRIT_PASSED: ${{ steps.critical-audit.outputs.audit_passed }}
+          # yamllint disable-line rule:line-length
+          CRIT_COUNT: ${{ steps.critical-audit.outputs.vulnerability_count }}
+          CRIT_REPORT: ${{ steps.critical-audit.outputs.report_path }}
+        run: |
+          # Verify lockfile synthesis and threshold behaviour
+          errors=0
+          if [ ! -f "${LOW_REPORT}" ]; then
+            echo "Audit report not found: ${LOW_REPORT} ❌"
+            errors=1
+          fi
+          # The synthesized lockfile must not persist in the project
+          if [ -f test-project/package-lock.json ]; then
+            echo "Synthesized lockfile left behind ❌"
+            errors=1
+          fi
+          # The vulnerability profile of a freshly synthesized
+          # dependency tree changes over time, so verify the outputs
+          # against the captured report rather than fixed counts
+          low_in_report="$(jq '
+            (.metadata.vulnerabilities.low // 0)
+            + (.metadata.vulnerabilities.moderate // 0)
+            + (.metadata.vulnerabilities.high // 0)
+            + (.metadata.vulnerabilities.critical // 0)' \
+            "${LOW_REPORT}")"
+          if [ "${low_in_report}" = "0" ]; then
+            expected_low="true"
+          else
+            expected_low="false"
+          fi
+          if [ "${LOW_PASSED}" != "${expected_low}" ]; then
+            echo "Low threshold disagrees with the report ❌"
+            echo "Output: ${LOW_PASSED}"
+            echo "Expected: ${expected_low}"
+            errors=1
+          fi
+          total_in_report="$(jq \
+            '.metadata.vulnerabilities.total // 0' "${LOW_REPORT}")"
+          if [ "${LOW_COUNT}" != "${total_in_report}" ]; then
+            echo "vulnerability_count disagrees with the report ❌"
+            echo "Output: ${LOW_COUNT}"
+            echo "Report: ${total_in_report}"
+            errors=1
+          fi
+          # The total count is threshold-independent
+          if [ "${CRIT_COUNT}" != "${LOW_COUNT}" ]; then
+            echo "Totals differ across thresholds ❌"
+            echo "Low threshold: ${LOW_COUNT}"
+            echo "Critical threshold: ${CRIT_COUNT}"
+            errors=1
+          fi
+          # The critical-threshold outcome must agree with the report
+          crit_in_report="$(jq \
+            '.metadata.vulnerabilities.critical // 0' "${CRIT_REPORT}")"
+          if [ "${crit_in_report}" = "0" ]; then
+            expected_crit="true"
+          else
+            expected_crit="false"
+          fi
+          if [ "${CRIT_PASSED}" != "${expected_crit}" ]; then
+            echo "Critical threshold disagrees with the report ❌"
+            echo "Output: ${CRIT_PASSED}"
+            echo "Expected: ${expected_crit}"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Real fixture tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Real fixture verified ✅"
+          {
+            echo "Real fixture verified ✅"
+            echo "Vulnerabilities reported: ${LOW_COUNT}"
+            echo "Critical vulnerabilities: ${crit_in_report}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test hard/soft failure semantics with known vulnerabilities ###
+  test-fail-semantics:
+    name: "Test: permit_fail semantics (vulnerable fixture)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Exact-pinned legacy packages with permanent security
+      # advisories (lodash 4.17.20: high; minimist 1.2.5: critical)
+      # give the failure-semantics tests a deterministic vulnerability
+      # profile; advisory databases keep historical records, so the
+      # findings can grow over time but never disappear. minimist
+      # sits in devDependencies so production scoping (--omit=dev)
+      # verifiably filters its advisories from the audit
+      - name: "Create fixture with known vulnerabilities"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Create fixture with known vulnerabilities
+          mkdir -p vulnerable-project
+          printf '%s\n' \
+            '{' \
+            '  "name": "vulnerable-fixture",' \
+            '  "version": "1.0.0",' \
+            '  "dependencies": {' \
+            '    "lodash": "4.17.20"' \
+            '  },' \
+            '  "devDependencies": {' \
+            '    "minimist": "1.2.5"' \
+            '  }' \
+            '}' \
+            > vulnerable-project/package.json
+
+      # permit_fail must report the findings yet succeed
+      - name: "Running local action: soft fail (permit_fail)"
+        id: soft-fail
+        uses: ./
+        with:
+          path_prefix: vulnerable-project
+          audit_level: low
+          permit_fail: 'true'
+          output_directory: audit-soft
+
+      # The same audit without permit_fail must fail the step
+      - name: "Running local action: hard fail"
+        id: hard-fail
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: vulnerable-project
+          audit_level: low
+          output_directory: audit-hard
+
+      # Production scoping must filter the dev-only advisories:
+      # npm audit includes devDependencies by default, so the
+      # production run reports fewer findings than the soft-fail run
+      - name: "Running local action: production scoping"
+        id: scope
+        uses: ./
+        with:
+          path_prefix: vulnerable-project
+          audit_level: low
+          permit_fail: 'true'
+          production_only: 'true'
+          output_directory: audit-scope
+
+      - name: "Verify hard/soft failure semantics"
+        shell: bash
+        env:
+          SOFT_OUTCOME: ${{ steps.soft-fail.outcome }}
+          SOFT_PASSED: ${{ steps.soft-fail.outputs.audit_passed }}
+          SOFT_COUNT: ${{ steps.soft-fail.outputs.vulnerability_count }}
+          SOFT_REPORT: ${{ steps.soft-fail.outputs.report_path }}
+          HARD_OUTCOME: ${{ steps.hard-fail.outcome }}
+          HARD_PASSED: ${{ steps.hard-fail.outputs.audit_passed }}
+          SCOPE_OUTCOME: ${{ steps.scope.outcome }}
+          SCOPE_COUNT: ${{ steps.scope.outputs.vulnerability_count }}
+        run: |
+          # Verify hard/soft failure semantics
+          errors=0
+          if [ "${SOFT_OUTCOME}" != "success" ]; then
+            echo "Soft-fail run failed: ${SOFT_OUTCOME} ❌"
+            errors=1
+          fi
+          if [ "${SOFT_PASSED}" != "false" ]; then
+            echo "Soft-fail run reported audit_passed=${SOFT_PASSED} ❌"
+            errors=1
+          fi
+          if [ -z "${SOFT_COUNT}" ] || [ "${SOFT_COUNT}" -lt 2 ]; then
+            echo "Vulnerability count below expectation: ${SOFT_COUNT} ❌"
+            errors=1
+          fi
+          if [ ! -f "${SOFT_REPORT}" ]; then
+            echo "Audit report not found: ${SOFT_REPORT} ❌"
+            errors=1
+          fi
+          if [ "${HARD_OUTCOME}" != "failure" ]; then
+            echo "Hard-fail run did not fail: ${HARD_OUTCOME} ❌"
+            errors=1
+          fi
+          if [ "${HARD_PASSED}" != "false" ]; then
+            echo "Hard-fail run reported audit_passed=${HARD_PASSED} ❌"
+            errors=1
+          fi
+          # Production scoping: the dev-only minimist advisories
+          # must drop out of the production-scoped count
+          if [ "${SCOPE_OUTCOME}" != "success" ]; then
+            echo "Scoped run failed: ${SCOPE_OUTCOME} ❌"
+            errors=1
+          fi
+          if [ -z "${SCOPE_COUNT}" ] || [ -z "${SOFT_COUNT}" ] || \
+            [ "${SCOPE_COUNT}" -ge "${SOFT_COUNT}" ]; then
+            echo "Production scoping made no difference ❌"
+            echo "Full findings: ${SOFT_COUNT}"
+            echo "Production findings: ${SCOPE_COUNT}"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Failure-semantics tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Hard/soft failure semantics verified ✅"
+          {
+            echo "Hard/soft failure semantics verified ✅"
+            echo "Vulnerabilities reported: ${SOFT_COUNT}"
+            echo "Production-scoped findings: ${SCOPE_COUNT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test invalid inputs fail closed ###
+  test-failures:
+    name: "Test: invalid inputs and error handling"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # A minimal project makes the escaping output directory the
+      # sole failure cause in that test
+      - name: "Create minimal project fixture"
+        shell: bash
+        run: |
+          # Create minimal project fixture
+          mkdir -p fake-project
+          printf '%s\n' \
+            '{"name": "fake-project", "version": "1.0.0"}' \
+            > fake-project/package.json
+
+      - name: "Running local action with invalid audit level"
+        id: bad-level
+        continue-on-error: true
+        uses: ./
+        with:
+          audit_level: severe
+
+      - name: "Running local action with invalid boolean"
+        id: bad-bool
+        continue-on-error: true
+        uses: ./
+        with:
+          production_only: maybe
+
+      - name: "Running local action with missing project directory"
+        id: bad-path
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: does/not/exist
+
+      - name: "Running local action with workspace-escaping path"
+        id: escape-path
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: /etc
+
+      - name: "Running local action with escaping output directory"
+        id: escape-output
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: fake-project
+          output_directory: /opt/escape-test
+
+      - name: "Running local action with empty version inputs"
+        id: no-version
+        continue-on-error: true
+        uses: ./
+        with:
+          node_version: ''
+
+      - name: "Verify invalid inputs were rejected"
+        shell: bash
+        env:
+          LEVEL_OUTCOME: ${{ steps.bad-level.outcome }}
+          BOOL_OUTCOME: ${{ steps.bad-bool.outcome }}
+          PATH_OUTCOME: ${{ steps.bad-path.outcome }}
+          ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
+          OUTPUT_ESCAPE_OUTCOME: ${{ steps.escape-output.outcome }}
+          NO_VERSION_OUTCOME: ${{ steps.no-version.outcome }}
+        run: |
+          # Failure testing is also important; all steps MUST fail
+          errors=0
+          for outcome_pair in \
+            "audit-level:${LEVEL_OUTCOME}" \
+            "boolean:${BOOL_OUTCOME}" \
+            "path:${PATH_OUTCOME}" \
+            "escape:${ESCAPE_OUTCOME}" \
+            "output-escape:${OUTPUT_ESCAPE_OUTCOME}" \
+            "no-version:${NO_VERSION_OUTCOME}"; do
+            test_name="${outcome_pair%%:*}"
+            outcome="${outcome_pair#*:}"
+            if [ "${outcome}" = "success" ]; then
+              echo "Invalid ${test_name} unexpectedly succeeded ❌"
+              errors=1
+            fi
+          done
+          if [ "${errors}" != "0" ]; then
+            echo "Failure-path tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Invalid inputs correctly rejected ✅"
+          echo "Invalid inputs correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

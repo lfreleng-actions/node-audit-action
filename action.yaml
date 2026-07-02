@@ -1,53 +1,475 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# node-audit-action
+name: "🛡️ Node.js Dependency Audit"
+# yamllint disable-line rule:line-length
+description: "Audits Node.js project dependencies for known vulnerabilities with npm audit"
+# The action captures the full JSON report to a file regardless of the
+# audit outcome, then evaluates the severity threshold itself from the
+# report metadata. Projects without a lockfile (common in legacy Linux
+# Foundation repositories) get a synthesized lockfile via
+# 'npm install --package-lock-only' before the audit runs, since
+# npm audit otherwise fails with ENOLOCK; the synthesized lockfile is
+# removed again when the audit step exits.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # Optional
+  path_prefix:
+    description: "Project directory; must resolve within the workspace"
+    required: false
+    default: "."
+  node_version:
+    # yamllint disable-line rule:line-length
+    description: "Node.js version to set up, such as '22', '22.x' or 'lts/*'; characters A-Z a-z 0-9 . * / _ -"
+    required: false
+    default: "22"
+  node_version_file:
+    # yamllint disable-line rule:line-length
+    description: "File containing the Node.js version, such as '.nvmrc'; takes precedence over node_version; must resolve within the workspace"
+    required: false
+    default: ""
+  audit_level:
+    # yamllint disable-line rule:line-length
+    description: "Fail threshold severity: 'info', 'low', 'moderate', 'high' or 'critical'"
+    required: false
+    default: "high"
+  production_only:
+    description: "Audit production dependencies only ('true'/'false')"
+    required: false
+    default: "false"
+  permit_fail:
+    # yamllint disable-line rule:line-length
+    description: "Report vulnerabilities at/above the threshold without failing ('true'/'false')"
+    required: false
+    default: "false"
+  output_directory:
+    # yamllint disable-line rule:line-length
+    description: "JSON report directory, within workspace or runner temp"
+    required: false
+    default: "."
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  audit_passed:
+    # yamllint disable-line rule:line-length
+    description: "'true' when no vulnerabilities at/above the threshold were found"
+    value: ${{ steps.audit.outputs.audit_passed }}
+  vulnerability_count:
+    description: "Total vulnerabilities reported across all severities"
+    value: ${{ steps.audit.outputs.vulnerability_count }}
+  report_path:
+    description: "Path to the JSON audit report"
+    value: ${{ steps.audit.outputs.report_path }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Validate inputs"
+      id: validate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_NODE_VERSION: ${{ inputs.node_version }}
+        INPUT_NODE_VERSION_FILE: ${{ inputs.node_version_file }}
+        INPUT_AUDIT_LEVEL: ${{ inputs.audit_level }}
+        INPUT_PRODUCTION_ONLY: ${{ inputs.production_only }}
+        INPUT_PERMIT_FAIL: ${{ inputs.permit_fail }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Validate inputs
+        # Preflight: fail with a clear message when required tools are
+        # missing (possible on minimal self-hosted runners)
+        for tool in jq realpath; do
+          if ! command -v "${tool}" > /dev/null 2>&1; then
+            echo "Error: required tool not found: ${tool} ❌"
+            echo "This action requires jq and realpath (GNU"
+            echo "coreutils) on the runner"
+            exit 1
+          fi
+        done
+        # The action requires GNU realpath -m (missing-path
+        # resolution); BSD/macOS realpath lacks it, and failing here
+        # gives a clearer error than a mid-run failure
+        if ! realpath -m -- / > /dev/null 2>&1; then
+          echo "Error: realpath does not support the -m option ❌"
+          echo "This action requires GNU coreutils realpath"
+          exit 1
+        fi
+        # The workspace/temp boundary checks depend on these runner
+        # environment variables: an empty value would degrade the
+        # case patterns to /* and disable the escape checks
+        for dir_var in GITHUB_WORKSPACE RUNNER_TEMP; do
+          dir_value="${!dir_var:-}"
+          if [ -z "${dir_value}" ] || [ ! -d "${dir_value}" ]; then
+            echo "Error: ${dir_var} not set to a directory ❌"
+            echo "This action requires a standard runner environment"
+            exit 1
+          fi
+        done
+        # A case glob validates the entire string, including embedded
+        # newlines; grep would only validate per line
+        case "${INPUT_AUDIT_LEVEL}" in
+          info|low|moderate|high|critical) ;;
+          *)
+            echo "Error: invalid audit_level ❌"
+            echo "Expected: info, low, moderate, high or critical"
+            exit 1 ;;
+        esac
+        case "${INPUT_PRODUCTION_ONLY}" in
+          true|false) ;;
+          *)
+            echo "Error: production_only must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_PERMIT_FAIL}" in
+          true|false) ;;
+          *)
+            echo "Error: permit_fail must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        # Restrict the Node.js version specifier to a safe character
+        # set; the value flows into the setup-node action input
+        if [ -n "${INPUT_NODE_VERSION}" ]; then
+          case "${INPUT_NODE_VERSION}" in
+            *[!A-Za-z0-9./*_-]*)
+              echo "Error: invalid node_version ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . * / _ -"
+              exit 1 ;;
+          esac
+        fi
+        # The version file takes precedence over node_version; check
+        # its character set, then confirm it resolves to a file within
+        # the workspace
+        node_version="${INPUT_NODE_VERSION}"
+        node_version_file=""
+        if [ -n "${INPUT_NODE_VERSION_FILE}" ]; then
+          case "${INPUT_NODE_VERSION_FILE}" in
+            *[!A-Za-z0-9./_-]*)
+              echo "Error: invalid node_version_file ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . / _ -"
+              exit 1 ;;
+          esac
+          case "${INPUT_NODE_VERSION_FILE}" in
+            /*) version_file="${INPUT_NODE_VERSION_FILE}" ;;
+            *)
+              version_file="${GITHUB_WORKSPACE}/"
+              version_file="${version_file}${INPUT_NODE_VERSION_FILE}"
+              ;;
+          esac
+          if [ ! -f "${version_file}" ]; then
+            echo "Error: node_version_file not found ❌"
+            exit 1
+          fi
+          # Fail closed: an empty result from a failed realpath
+          # would degrade the case pattern below to /* and accept
+          # any path
+          if ! resolved="$(realpath -- "${version_file}")" || \
+            [ -z "${resolved}" ]; then
+            echo "Error: cannot resolve node_version_file ❌"
+            exit 1
+          fi
+          if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" || \
+            [ -z "${workspace}" ]; then
+            echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+            exit 1
+          fi
+          case "${resolved}/" in
+            "${workspace}/"*) ;;
+            *)
+              echo "Error: node_version_file escapes the workspace ❌"
+              exit 1 ;;
+          esac
+          node_version=""
+          node_version_file="${INPUT_NODE_VERSION_FILE}"
+        fi
+        if [ -z "${node_version}" ] && [ -z "${node_version_file}" ]; then
+          echo "Error: no Node.js version specified ❌"
+          echo "Provide node_version or node_version_file"
+          exit 1
+        fi
+        # Anchor relative paths to GITHUB_WORKSPACE: composite
+        # actions can run with a caller-set working directory, so
+        # resolving against the current directory would be
+        # non-deterministic
+        case "${INPUT_PATH_PREFIX}" in
+          /*) project_dir="${INPUT_PATH_PREFIX}" ;;
+          *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
+        esac
+        if [ ! -d "${project_dir}" ]; then
+          echo "Error: invalid project directory ❌"
+          # Strip CR/LF before logging the untrusted path: embedded
+          # newlines could otherwise inject workflow commands via the
+          # log stream
+          printf 'Path not found: %s\n' \
+            "$(printf '%s' "${project_dir}" | tr -d '\r\n')"
+          exit 1
+        fi
+        # Restrict the audit to the workspace: an absolute or escaped
+        # path could otherwise expose runner filesystem details in
+        # the report and any uploaded artifacts. Fail closed on
+        # realpath failure: an empty result would degrade the case
+        # pattern below to /* and accept any path
+        if ! resolved="$(realpath -- "${project_dir}")" || \
+          [ -z "${resolved}" ]; then
+          echo "Error: cannot resolve project directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" || \
+          [ -z "${workspace}" ]; then
+          echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${resolved}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        if [ ! -f "${resolved}/package.json" ]; then
+          echo "Error: no package.json in project directory ❌"
+          exit 1
+        fi
+        # Both values passed the character allowlists above, so the
+        # plain output format is safe here
+        echo "node_version=${node_version}" >> "$GITHUB_OUTPUT"
+        echo "node_version_file=${node_version_file}" >> "$GITHUB_OUTPUT"
+
+    - name: "Setup Node.js"
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: ${{ steps.validate.outputs.node_version }}
+        node-version-file: ${{ steps.validate.outputs.node_version_file }}
+
+    - name: "Audit dependencies"
+      id: audit
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        AUDIT_LEVEL: ${{ inputs.audit_level }}
+        PRODUCTION_ONLY: ${{ inputs.production_only }}
+        PERMIT_FAIL: ${{ inputs.permit_fail }}
+        OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
+      run: |
+        # Audit dependencies
+        # setup-node provides node/npm; confirm before use in case a
+        # caller-side setup problem left the tools unavailable
+        for tool in node npm; do
+          if ! command -v "${tool}" > /dev/null 2>&1; then
+            echo "Error: required tool not found: ${tool} ❌"
+            exit 1
+          fi
+        done
+        # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
+        # deterministic when the caller sets a working directory. The
+        # :? expansions hard-fail on unset/empty runner variables,
+        # which would otherwise weaken the boundary checks below
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        # Re-resolve and enforce the workspace boundary at the point
+        # of use: the workspace is mutable between steps, so relying
+        # solely on the earlier validate step would leave a TOCTOU
+        # gap (a validated directory swapped for an escaping
+        # symlink). Fail closed on realpath failure: an empty result
+        # would degrade the case pattern below to /* and accept any
+        # path
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" || \
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: cannot resolve project directory ❌"
+          exit 1
+        fi
+        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" || \
+          [ -z "${boundary}" ]; then
+          echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        # Convert the output directory to an absolute path anchored
+        # to GITHUB_WORKSPACE. Resolution (realpath -m) happens BEFORE
+        # any mkdir, and the boundary check applies in ALL cases: the
+        # resolved path must sit within GITHUB_WORKSPACE or
+        # RUNNER_TEMP, as writing elsewhere on the runner filesystem
+        # is an operational/security risk
+        if [ -z "${OUTPUT_DIRECTORY}" ]; then
+          OUTPUT_DIRECTORY="."
+        fi
+        case "${OUTPUT_DIRECTORY}" in
+          /*) ;;
+          *) OUTPUT_DIRECTORY="${GITHUB_WORKSPACE}/${OUTPUT_DIRECTORY}" ;;
+        esac
+        # Fail closed on realpath failure: an empty result would
+        # degrade the case pattern below to /* and accept any path
+        if ! OUTPUT_DIR="$(realpath -m -- "${OUTPUT_DIRECTORY}")" || \
+          [ -z "${OUTPUT_DIR}" ]; then
+          echo "Error: cannot resolve output directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE:?}")" || \
+          [ -z "${workspace}" ]; then
+          echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        if ! temp_dir="$(realpath -- "${RUNNER_TEMP:?}")" || \
+          [ -z "${temp_dir}" ]; then
+          echo "Error: cannot resolve RUNNER_TEMP ❌"
+          exit 1
+        fi
+        case "${OUTPUT_DIR}/" in
+          "${workspace}/"*|"${temp_dir}/"*) ;;
+          *)
+            echo "Error: output directory outside permitted locations ❌"
+            echo "output_directory must resolve within"
+            echo "GITHUB_WORKSPACE or RUNNER_TEMP"
+            exit 1 ;;
+        esac
+        mkdir -p -- "${OUTPUT_DIR}"
+        report_path="${OUTPUT_DIR}/npm-audit-report.json"
+
+        cd "${PROJECT_DIR}" || exit 1
+
+        # npm audit requires a lockfile and fails with ENOLOCK when
+        # one is missing (common in legacy projects that installed
+        # from package.json alone). Synthesize one without installing
+        # or running scripts, and remove it again on step exit so the
+        # workspace stays as found. Lockfiles record every dependency
+        # scope, so the synthesis needs no production filtering; the
+        # audit itself applies --omit=dev
+        if [ ! -f package-lock.json ] && \
+          [ ! -f npm-shrinkwrap.json ]; then
+          echo "No lockfile found; synthesizing package-lock.json 💬"
+          trap 'rm -f -- "${PROJECT_DIR}/package-lock.json"' EXIT
+          npm install --package-lock-only --ignore-scripts \
+            --no-audit --no-fund
+        fi
+
+        # Run the audit and capture the full JSON report to the
+        # output file regardless of the exit code; npm audit exits
+        # non-zero whenever it finds vulnerabilities, and the
+        # threshold evaluation below works from the report instead
+        set -- --json
+        if [ "${PRODUCTION_ONLY}" = "true" ]; then
+          set -- "$@" --omit=dev
+        fi
+        set +e
+        npm audit "$@" > "${report_path}"
+        audit_exit=$?
+        set -e
+        echo "npm audit exited with code ${audit_exit}"
+
+        # Distinguish findings from tool failure: a valid report
+        # carries the vulnerability metadata object; anything else
+        # (network failure, registry error) fails the action outright
+        if ! jq -e '.metadata.vulnerabilities | type == "object"' \
+          "${report_path}" > /dev/null 2>&1; then
+          echo "Error: npm audit did not produce a valid report ❌"
+          summary="$(jq -r '.error.summary // empty' \
+            "${report_path}" 2>/dev/null | tr -d '\r\n')"
+          if [ -n "${summary}" ]; then
+            printf 'npm reported: %s\n' "${summary}"
+          fi
           exit 1
         fi
 
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
+        # Evaluate the severity threshold from the report metadata:
+        # count vulnerabilities at or above the configured level.
+        # AUDIT_LEVEL passed the enum validation, and jq receives it
+        # as a variable rather than program text
+        threshold_count="$(jq --arg level "${AUDIT_LEVEL}" '
+          {"info":0,"low":1,"moderate":2,"high":3,"critical":4}
+            as $rank
+          | .metadata.vulnerabilities
+          | to_entries
+          | map(select(.key != "total"
+              and $rank[.key] != null
+              and $rank[.key] >= $rank[$level]) | .value)
+          | add // 0' "${report_path}")"
+        total="$(jq '.metadata.vulnerabilities.total // 0' \
+          "${report_path}")"
+        critical="$(jq '.metadata.vulnerabilities.critical // 0' \
+          "${report_path}")"
+        high="$(jq '.metadata.vulnerabilities.high // 0' \
+          "${report_path}")"
+        moderate="$(jq '.metadata.vulnerabilities.moderate // 0' \
+          "${report_path}")"
+        low="$(jq '.metadata.vulnerabilities.low // 0' \
+          "${report_path}")"
+        info="$(jq '.metadata.vulnerabilities.info // 0' \
+          "${report_path}")"
+
+        if [ "${threshold_count}" = "0" ]; then
+          audit_passed="true"
+        else
+          audit_passed="false"
+        fi
+
+        # audit_passed and the counts are validated/derived values;
+        # the report path derives from caller-controlled input and
+        # can legally contain newlines, so it uses the multiline
+        # heredoc output format with a random delimiter (built from
+        # shell-builtin randomness, regenerated until provably absent
+        # from the value) to prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
           delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        done
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        echo "audit_passed=${audit_passed}" >> "$GITHUB_OUTPUT"
+        echo "vulnerability_count=${total}" >> "$GITHUB_OUTPUT"
+        emit_output "report_path" "${report_path}"
+
         {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🛡️ Node.js Dependency Audit"
+          echo ""
+          echo "| Severity | Count |"
+          echo "| -------- | ----- |"
+          echo "| Critical | ${critical} |"
+          echo "| High | ${high} |"
+          echo "| Moderate | ${moderate} |"
+          echo "| Low | ${low} |"
+          echo "| Info | ${info} |"
+          echo "| **Total** | **${total}** |"
+          echo ""
+          echo "**Threshold:** ${AUDIT_LEVEL} and above"
+          echo "**Production dependencies only:** ${PRODUCTION_ONLY}"
+          if [ "${audit_passed}" = "true" ]; then
+            echo "**Result:** passed ✅"
+          elif [ "${PERMIT_FAIL}" = "true" ]; then
+            echo "**Result:** ${threshold_count} at/above" \
+              "threshold; permitted to continue ⚠️"
+          else
+            echo "**Result:** ${threshold_count} at/above" \
+              "threshold ❌"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "${audit_passed}" = "true" ]; then
+          echo "Audit passed: no vulnerabilities at/above" \
+            "${AUDIT_LEVEL} ✅"
+          exit 0
+        fi
+        if [ "${PERMIT_FAIL}" = "true" ]; then
+          echo "::warning::npm audit found ${threshold_count}" \
+            "vulnerabilities at/above ${AUDIT_LEVEL};" \
+            "continuing (permit_fail: true)"
+          exit 0
+        fi
+        echo "::error::npm audit found ${threshold_count}" \
+          "vulnerabilities at/above ${AUDIT_LEVEL} ❌"
+        exit 1
