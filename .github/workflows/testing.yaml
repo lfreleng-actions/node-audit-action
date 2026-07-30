@@ -46,12 +46,12 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Checkout repository"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: "Checkout test project: lfreleng-actions/test-node-project"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: lfreleng-actions/test-node-project
           ref: 89cc7f156c88afa1855087b00ac0dce886e7b0f3
@@ -172,7 +172,7 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Checkout repository"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -180,7 +180,7 @@ jobs:
       # so it exercises the lockfile synthesis path and requires an
       # explicit Node.js version
       - name: "Checkout test project: onap/sdc-onap-ui-common"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: onap/sdc-onap-ui-common
           ref: c305ee4240e368dd0b2238a4f39881a97bad6746
@@ -319,7 +319,7 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Checkout repository"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -470,7 +470,7 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Checkout repository"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
