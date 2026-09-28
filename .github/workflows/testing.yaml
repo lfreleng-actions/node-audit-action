@@ -45,11 +45,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: "Checkout test project: lfreleng-actions/test-node-project"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,7 +55,7 @@ jobs:
 
       - name: "Running local action: default audit"
         id: default-audit
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           permit_fail: 'true'
@@ -68,7 +63,7 @@ jobs:
 
       - name: "Running local action: production dependencies only"
         id: production-audit
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           permit_fail: 'true'
@@ -171,11 +166,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       # The fixture has no lockfile, no engines field and no .nvmrc,
       # so it exercises the lockfile synthesis path and requires an
       # explicit Node.js version
@@ -189,7 +179,7 @@ jobs:
 
       - name: "Running local action: low threshold"
         id: low-audit
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           node_version: '22'
@@ -202,7 +192,7 @@ jobs:
       # vulnerability profile
       - name: "Running local action: critical threshold"
         id: critical-audit
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           node_version: '22'
@@ -318,11 +308,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       # Exact-pinned legacy packages with permanent security
       # advisories (lodash 4.17.20: high; minimist 1.2.5: critical)
       # give the failure-semantics tests a deterministic vulnerability
@@ -351,7 +336,7 @@ jobs:
       # permit_fail must report the findings yet succeed
       - name: "Running local action: soft fail (permit_fail)"
         id: soft-fail
-        uses: ./
+        uses: $/
         with:
           path_prefix: vulnerable-project
           audit_level: low
@@ -362,7 +347,7 @@ jobs:
       - name: "Running local action: hard fail"
         id: hard-fail
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: vulnerable-project
           audit_level: low
@@ -373,7 +358,7 @@ jobs:
       # production run reports fewer findings than the soft-fail run
       - name: "Running local action: production scoping"
         id: scope
-        uses: ./
+        uses: $/
         with:
           path_prefix: vulnerable-project
           audit_level: low
@@ -469,11 +454,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       # A minimal project makes the escaping output directory the
       # sole failure cause in that test
       - name: "Create minimal project fixture"
@@ -488,35 +468,35 @@ jobs:
       - name: "Running local action with invalid audit level"
         id: bad-level
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           audit_level: severe
 
       - name: "Running local action with invalid boolean"
         id: bad-bool
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           production_only: maybe
 
       - name: "Running local action with missing project directory"
         id: bad-path
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: does/not/exist
 
       - name: "Running local action with workspace-escaping path"
         id: escape-path
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: /etc
 
       - name: "Running local action with escaping output directory"
         id: escape-output
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: fake-project
           output_directory: /opt/escape-test
@@ -524,7 +504,7 @@ jobs:
       - name: "Running local action with empty version inputs"
         id: no-version
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           node_version: ''
 
