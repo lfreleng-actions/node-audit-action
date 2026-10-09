@@ -44,7 +44,10 @@ support) on the runner. GitHub-hosted Ubuntu runners
 include these tools; minimal self-hosted or non-Linux runners must
 provide them. The action checks for them up front and fails with a
 clear error naming any missing tool. It installs Node.js and npm via
-the pinned `actions/setup-node` action, without dependency caching.
+the pinned `actions/setup-node` action, without dependency caching:
+it passes `package-manager-cache: false`, so a `packageManager` or
+`devEngines.packageManager` field naming npm does not switch on
+setup-node's automatic npm cache.
 `npm audit` needs egress to the npm registry
 (`registry.npmjs.org`).
 
@@ -151,7 +154,8 @@ summary:
 ## Notes
 
 - The action performs no dependency caching, in line with the
-  organisation's cache-poisoning stance
+  organisation's cache-poisoning stance (CWE-349); it disables
+  setup-node's automatic npm cache explicitly
 - Fresh lockfile synthesis resolves the newest versions the project's
   version ranges permit, so results for lockfile-free projects reflect
   the tree a fresh install would produce, not a historical install

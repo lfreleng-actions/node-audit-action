@@ -241,6 +241,11 @@ runs:
       with:
         node-version: ${{ steps.validate.outputs.node_version }}
         node-version-file: ${{ steps.validate.outputs.node_version_file }}
+        # setup-node enables an npm cache on its own when the
+        # workspace package.json names npm in packageManager or
+        # devEngines.packageManager; the organisation avoids
+        # dependency caching (cache poisoning, CWE-349)
+        package-manager-cache: false
 
     - name: "Audit dependencies"
       id: audit
