@@ -5,10 +5,13 @@
 # node-audit-action
 name: "🛡️ Node.js Dependency Audit"
 # yamllint disable-line rule:line-length
-description: "Audits Node.js project dependencies for known vulnerabilities with npm audit"
-# The action captures the full JSON report to a file regardless of the
-# audit outcome, then evaluates the severity threshold itself from the
-# report metadata. Projects without a lockfile (common in legacy Linux
+description: "Audits Node.js project dependencies for known vulnerabilities with npm, Yarn, pnpm or Bun"
+# The action audits the lockfile the project installs from, with the
+# package manager that owns it, and captures the full JSON report to
+# a file regardless of the audit outcome. It then evaluates the
+# severity threshold itself from the report metadata; native Yarn,
+# pnpm and Bun reports are normalised into the npm metadata shape
+# first. Projects without any lockfile (common in legacy Linux
 # Foundation repositories) get a synthesized lockfile via
 # 'npm install --package-lock-only' before the audit runs, since
 # npm audit otherwise fails with ENOLOCK; the synthesized lockfile is
@@ -49,6 +52,11 @@ inputs:
     description: "JSON report directory, within workspace or runner temp"
     required: false
     default: "."
+  package_manager:
+    # yamllint disable-line rule:line-length
+    description: "Package manager to audit with: 'auto' (detect from the lockfile), 'npm', 'yarn', 'pnpm' or 'bun'"
+    required: false
+    default: "auto"
 
 outputs:
   audit_passed:
@@ -61,6 +69,9 @@ outputs:
   report_path:
     description: "Path to the JSON audit report"
     value: ${{ steps.audit.outputs.report_path }}
+  package_manager:
+    description: "Package manager that ran the audit: npm, yarn, pnpm or bun"
+    value: ${{ steps.validate.outputs.package_manager }}
 
 runs:
   using: "composite"
@@ -75,6 +86,7 @@ runs:
         INPUT_AUDIT_LEVEL: ${{ inputs.audit_level }}
         INPUT_PRODUCTION_ONLY: ${{ inputs.production_only }}
         INPUT_PERMIT_FAIL: ${{ inputs.permit_fail }}
+        INPUT_PACKAGE_MANAGER: ${{ inputs.package_manager }}
       run: |
         # Validate inputs
         # Preflight: fail with a clear message when required tools are
@@ -125,6 +137,13 @@ runs:
           true|false) ;;
           *)
             echo "Error: permit_fail must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_PACKAGE_MANAGER}" in
+          auto|npm|yarn|pnpm|bun) ;;
+          *)
+            echo "Error: invalid package_manager ❌"
+            echo "Expected: auto, npm, yarn, pnpm or bun"
             exit 1 ;;
         esac
         # Restrict the Node.js version specifier to a safe character
@@ -230,10 +249,54 @@ runs:
           echo "Error: no package.json in project directory ❌"
           exit 1
         fi
-        # Both values passed the character allowlists above, so the
-        # plain output format is safe here
+        # Pick the package manager whose lockfile the project installs
+        # from. In auto mode a lockfile belonging to the manager that
+        # package.json declares in packageManager wins; otherwise the
+        # first lockfile found decides, npm first so projects already
+        # audited with npm keep that behaviour. Without any lockfile
+        # the npm lockfile synthesis applies
+        has_lockfile() {
+          case "$1" in
+            npm)
+              [ -f "${resolved}/package-lock.json" ] || \
+                [ -f "${resolved}/npm-shrinkwrap.json" ] ;;
+            yarn) [ -f "${resolved}/yarn.lock" ] ;;
+            pnpm) [ -f "${resolved}/pnpm-lock.yaml" ] ;;
+            bun)
+              [ -f "${resolved}/bun.lock" ] || \
+                [ -f "${resolved}/bun.lockb" ] ;;
+            *) return 1 ;;
+          esac
+        }
+        package_manager="${INPUT_PACKAGE_MANAGER}"
+        if [ "${package_manager}" = "auto" ]; then
+          package_manager=""
+          declared="$(jq -r '.packageManager // "" | strings' \
+            "${resolved}/package.json" 2>/dev/null)" || declared=""
+          declared="${declared%%@*}"
+          if has_lockfile "${declared}"; then
+            package_manager="${declared}"
+          else
+            for candidate in npm pnpm yarn bun; do
+              if has_lockfile "${candidate}"; then
+                package_manager="${candidate}"
+                break
+              fi
+            done
+          fi
+          package_manager="${package_manager:-npm}"
+          echo "Detected package manager: ${package_manager} 💬"
+        elif [ "${package_manager}" != "npm" ] && \
+          ! has_lockfile "${package_manager}"; then
+          echo "Error: no ${package_manager} lockfile in project ❌"
+          echo "Native ${package_manager} audits read the lockfile"
+          exit 1
+        fi
+        # All three values passed the allowlists above, so the plain
+        # output format is safe here
         echo "node_version=${node_version}" >> "$GITHUB_OUTPUT"
         echo "node_version_file=${node_version_file}" >> "$GITHUB_OUTPUT"
+        echo "package_manager=${package_manager}" >> "$GITHUB_OUTPUT"
 
     - name: "Setup Node.js"
       # yamllint disable-line rule:line-length
@@ -247,6 +310,18 @@ runs:
         # dependency caching (cache poisoning, CWE-349)
         package-manager-cache: false
 
+    # Bun ships as a standalone binary rather than through Corepack;
+    # 'bun audit' first appeared in Bun 1.2.15, so the action runs
+    # its own pinned release rather than one the project declares
+    - name: "Setup Bun"
+      if: steps.validate.outputs.package_manager == 'bun'
+      # yamllint disable-line rule:line-length
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      with:
+        bun-version: "1.4.2"
+        # The organisation avoids caching (cache poisoning, CWE-349)
+        no-cache: true
+
     - name: "Audit dependencies"
       id: audit
       shell: bash
@@ -256,6 +331,16 @@ runs:
         PRODUCTION_ONLY: ${{ inputs.production_only }}
         PERMIT_FAIL: ${{ inputs.permit_fail }}
         OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
+        PACKAGE_MANAGER: ${{ steps.validate.outputs.package_manager }}
+        ACTION_PATH: ${{ github.action_path }}
+        # Releases the action runs when package.json declares none for
+        # the package manager in packageManager. The names avoid the
+        # YARN_ and COREPACK_ prefixes, which those tools read as
+        # configuration. Corepack itself comes from the lockfile in
+        # scripts/tools
+        DEFAULT_YARN_CLASSIC: "1.22.22"
+        DEFAULT_YARN_BERRY: "4.18.1"
+        DEFAULT_PNPM: "10.34.6"
       run: |
         # Audit dependencies
         # setup-node provides node/npm; confirm before use in case a
@@ -337,49 +422,329 @@ runs:
             exit 1 ;;
         esac
         mkdir -p -- "${OUTPUT_DIR}"
-        report_path="${OUTPUT_DIR}/npm-audit-report.json"
+        report_path="${OUTPUT_DIR}/${PACKAGE_MANAGER}-audit-report.json"
 
         cd "${PROJECT_DIR}" || exit 1
 
-        # npm audit requires a lockfile and fails with ENOLOCK when
-        # one is missing (common in legacy projects that installed
-        # from package.json alone). Synthesize one without installing
-        # or running scripts, and remove it again on step exit so the
-        # workspace stays as found. Lockfiles record every dependency
-        # scope, so the synthesis needs no production filtering; the
-        # audit itself applies --omit=dev
-        if [ ! -f package-lock.json ] && \
-          [ ! -f npm-shrinkwrap.json ]; then
-          echo "No lockfile found; synthesizing package-lock.json 💬"
-          trap 'rm -f -- "${PROJECT_DIR}/package-lock.json"' EXIT
-          npm install --package-lock-only --ignore-scripts \
-            --no-audit --no-fund
-        fi
+        # Scratch space for the Corepack install and the raw audit
+        # output. Paths the audit creates in the project join
+        # created_paths; both go on step exit, leaving the workspace
+        # as found
+        work_dir="$(mktemp -d "${RUNNER_TEMP:?}/node-audit.XXXXXX")"
+        created_paths=()
+        cleanup() {
+          for created_path in "${created_paths[@]}"; do
+            rm -rf -- "${created_path}"
+          done
+          rm -rf -- "${work_dir}"
+        }
+        trap cleanup EXIT
 
-        # Run the audit and capture the full JSON report to the
-        # output file regardless of the exit code; npm audit exits
-        # non-zero whenever it finds vulnerabilities, and the
-        # threshold evaluation below works from the report instead
-        set -- --json
-        if [ "${PRODUCTION_ONLY}" = "true" ]; then
-          set -- "$@" --omit=dev
-        fi
+        # Corepack provisions Yarn and pnpm, running the release that
+        # package.json pins in packageManager. It installs into the
+        # scratch space rather than globally, so later caller steps
+        # see no change, and auto-pinning stays off so it never
+        # writes packageManager into package.json.
+        #
+        # The audit must not run code from the repository, which may
+        # be untrusted (a pull request from a fork). Corepack skips
+        # the project's .corepack.env, which could set NODE_OPTIONS;
+        # Yarn ignores a committed release (yarnPath or yarn-path);
+        # Yarn Berry reads sanitised copies of .yarnrc.yml without
+        # plugins (see sanitise_yarnrc); pnpm skips .pnpmfile.cjs.
+        # Corepack only runs official releases unless
+        # COREPACK_ENABLE_UNSAFE_CUSTOM_URLS is set, which the
+        # project can no longer do
+        corepack_bin=""
+        tools_dir="${work_dir}/tools"
+        setup_corepack() {
+          # npm ci installs the releases the committed lockfile pins,
+          # verifying their integrity hashes, and with engine-strict
+          # refuses a Node.js release Corepack does not support
+          echo "Installing Corepack from the action's lockfile 💬"
+          mkdir -p -- "${tools_dir}"
+          cp -- "${ACTION_PATH}/scripts/tools/package.json" \
+            "${ACTION_PATH}/scripts/tools/package-lock.json" \
+            "${ACTION_PATH}/scripts/sanitise-yarnrc.cjs" \
+            "${tools_dir}/"
+          if ! (cd "${tools_dir}" && npm ci --engine-strict \
+            --ignore-scripts --no-audit --no-fund --loglevel=error \
+            > /dev/null); then
+            supported="$(jq -r '.packages["node_modules/corepack"]
+              .engines.node // "unknown"' \
+              "${tools_dir}/package-lock.json")"
+            echo "Error: could not install Corepack ($(node --version)) ❌"
+            echo "Yarn and pnpm audits need Node.js ${supported}"
+            exit 1
+          fi
+          corepack_bin="${tools_dir}/node_modules/.bin/corepack"
+          export COREPACK_HOME="${work_dir}/corepack-home"
+          export COREPACK_ENV_FILE=0
+          export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+          export COREPACK_ENABLE_AUTO_PIN=0
+          export COREPACK_ENABLE_STRICT=0
+          export YARN_IGNORE_PATH=1
+          # Yarn's own writes go to the scratch space, so neither the
+          # checkout (through a planted symlink) nor its configuration
+          # can direct them elsewhere; environment settings outrank
+          # rc files. Yarn Berry would otherwise write
+          # .yarn/install-state.gz into the project
+          export YARN_INSTALL_STATE_PATH="${work_dir}/yarn/install-state.gz"
+          export YARN_GLOBAL_FOLDER="${work_dir}/yarn/global"
+          export YARN_CACHE_FOLDER="${work_dir}/yarn/cache"
+          export YARN_ENABLE_COLORS=0
+          export FORCE_COLOR=0
+          export YARN_ENABLE_TELEMETRY=0
+        }
+        # Yarn Berry reads .yarnrc.yml from the project directory and
+        # every parent, plus the user's home, and loads the plugins
+        # they declare on every command. Point it at a file name only
+        # this run uses, holding a sanitised copy of each .yarnrc.yml
+        # from the project up to the workspace root; Yarn then merges
+        # those copies as it would the originals. Files above the
+        # workspace, outside the repository, are not read. The home
+        # file is read by its fixed name whatever YARN_RC_FILENAME
+        # says, so its sanitised copy goes into a home folder of its
+        # own that Berry runs with. Yarn classic reads .yarnrc
+        # instead and ignores all of this
+        sanitise_yarnrc() {
+          export YARN_RC_FILENAME=".yarnrc.node-audit.${work_dir##*.}.yml"
+          yarn_home="${work_dir}/yarn/home"
+          mkdir -p -- "${yarn_home}"
+          local rc_dirs=() dir="${PROJECT_DIR}" sanitised
+          while :; do
+            rc_dirs+=("${dir}")
+            if [ "${dir}" = "${boundary}" ] || [ "${dir}" = "/" ]; then
+              break
+            fi
+            dir="$(dirname -- "${dir}")"
+          done
+          for dir in "${rc_dirs[@]}"; do
+            [ -f "${dir}/.yarnrc.yml" ] || continue
+            sanitised="${dir}/${YARN_RC_FILENAME}"
+            if [ -e "${sanitised}" ]; then
+              echo "Error: ${sanitised} already exists ❌"
+              exit 1
+            fi
+            created_paths+=("${sanitised}")
+            if ! node "${tools_dir}/sanitise-yarnrc.cjs" \
+              "${dir}/.yarnrc.yml" "${sanitised}"; then
+              echo "Error: could not read ${dir}/.yarnrc.yml ❌"
+              exit 1
+            fi
+          done
+          # A home inside the workspace already has its copy above
+          case " ${rc_dirs[*]} " in
+            *" ${HOME:-} "*) return ;;
+          esac
+          if [ -n "${HOME:-}" ] && [ -f "${HOME}/.yarnrc.yml" ] && \
+            ! node "${tools_dir}/sanitise-yarnrc.cjs" \
+              "${HOME}/.yarnrc.yml" "${yarn_home}/.yarnrc.yml"; then
+            echo "Error: could not read ${HOME}/.yarnrc.yml ❌"
+            exit 1
+          fi
+        }
+        # Fetches the release Corepack runs for a spec into the empty
+        # COREPACK_HOME and prints its version, read from the cache
+        # directory. Running the tool to ask would execute project
+        # code: 'pnpm --version' loads .pnpmfile.cjs whatever the
+        # configuration says. A bare name means the release
+        # package.json declares
+        corepack_prepare() {
+          local name="$1" spec="$2" releases
+          if [ "${spec}" = "${name}" ]; then
+            "${corepack_bin}" install > /dev/null || return 1
+          else
+            "${corepack_bin}" install --global "${spec}" > /dev/null \
+              || return 1
+          fi
+          releases=("${COREPACK_HOME}/v1/${name}"/*)
+          if [ "${#releases[@]}" != 1 ] || [ ! -d "${releases[0]}" ]; then
+            return 1
+          fi
+          basename -- "${releases[0]}"
+        }
+        declared="$(jq -r '.packageManager // "" | strings' \
+          package.json 2>/dev/null)" || declared=""
+        declared_name="${declared%%@*}"
+
+        # Build the native audit command. Each tool keeps the
+        # production_only meaning of npm's --omit=dev: production and
+        # optional dependencies, without development ones
+        tool="${PACKAGE_MANAGER}"
+        case "${PACKAGE_MANAGER}" in
+          npm)
+            # npm audit requires a lockfile and fails with ENOLOCK
+            # when one is missing (common in legacy projects that
+            # installed from package.json alone). Synthesize one
+            # without installing or running scripts; the cleanup
+            # removes it again. Lockfiles record every dependency
+            # scope, so the synthesis needs no production filtering;
+            # the audit itself applies --omit=dev
+            # Synthesize only where no lockfile path exists at all.
+            # Anything else there is refused rather than written
+            # through or cleaned up: a dangling symlink would point the
+            # write outside the project, and the cleanup would remove a
+            # directory from the checkout
+            for lockfile in package-lock.json npm-shrinkwrap.json; do
+              if [ -e "${lockfile}" ] || [ -L "${lockfile}" ]; then
+                if [ ! -f "${lockfile}" ]; then
+                  echo "Error: ${lockfile} is not a regular file ❌"
+                  exit 1
+                fi
+              fi
+            done
+            if [ ! -f package-lock.json ] && \
+              [ ! -f npm-shrinkwrap.json ]; then
+              echo "No lockfile found; synthesizing package-lock.json 💬"
+              created_paths+=("${PROJECT_DIR}/package-lock.json")
+              npm install --package-lock-only --ignore-scripts \
+                --no-audit --no-fund
+            fi
+            tool_version="$(npm --version)"
+            set -- npm audit --json
+            if [ "${PRODUCTION_ONLY}" = "true" ]; then
+              set -- "$@" --omit=dev
+            fi
+            ;;
+          yarn)
+            setup_corepack
+            # Without a declared release, a .yarnrc.yml or a Berry
+            # lockfile (it opens with __metadata) marks Yarn 2+
+            if [ "${declared_name}" = "yarn" ]; then
+              yarn_spec="yarn"
+            elif [ -f .yarnrc.yml ] || \
+              grep -q '^__metadata:' yarn.lock; then
+              yarn_spec="yarn@${DEFAULT_YARN_BERRY}"
+            else
+              yarn_spec="yarn@${DEFAULT_YARN_CLASSIC}"
+            fi
+            if ! tool_version="$(corepack_prepare yarn "${yarn_spec}")"; then
+              echo "Error: Corepack could not fetch Yarn ❌"
+              exit 1
+            fi
+            case "${tool_version}" in
+              1.*)
+                tool="yarn-classic"
+                set -- "${corepack_bin}" "${yarn_spec}" audit --json
+                if [ "${PRODUCTION_ONLY}" = "true" ]; then
+                  # One argument: Yarn splits it on spaces, but given
+                  # separate words audits the first group alone
+                  # (yarnpkg/yarn#8495)
+                  set -- "$@" --groups "dependencies optionalDependencies"
+                fi
+                ;;
+              *)
+                tool="yarn-berry"
+                # Only Berry reads .yarnrc.yml; Yarn classic ignores it
+                sanitise_yarnrc
+                set -- env HOME="${yarn_home}" \
+                  "${corepack_bin}" "${yarn_spec}" npm audit \
+                  --json --recursive --all
+                # Yarn 4 also reports deprecated packages as moderate
+                # advisories, which npm audit does not; Yarn 2 and 3
+                # report none and reject the flag
+                case "${tool_version}" in
+                  2.*|3.*) ;;
+                  *) set -- "$@" --no-deprecations ;;
+                esac
+                if [ "${PRODUCTION_ONLY}" = "true" ]; then
+                  set -- "$@" --environment production
+                fi
+                ;;
+            esac
+            ;;
+          pnpm)
+            setup_corepack
+            pnpm_spec="pnpm@${DEFAULT_PNPM}"
+            if [ "${declared_name}" = "pnpm" ]; then
+              pnpm_spec="pnpm"
+            fi
+            if ! tool_version="$(corepack_prepare pnpm "${pnpm_spec}")"; then
+              echo "Error: Corepack could not fetch pnpm ❌"
+              exit 1
+            fi
+            # The flag outranks every configuration source, including
+            # pnpm-workspace.yaml
+            set -- "${corepack_bin}" "${pnpm_spec}" audit --json \
+              --config.ignore-pnpmfile=true
+            if [ "${PRODUCTION_ONLY}" = "true" ]; then
+              set -- "$@" --prod
+            fi
+            ;;
+          bun)
+            if ! command -v bun > /dev/null 2>&1; then
+              echo "Error: required tool not found: bun ❌"
+              exit 1
+            fi
+            tool_version="$(bun --version | tr -d '\r')"
+            set -- bun audit --json
+            if [ "${PRODUCTION_ONLY}" = "true" ]; then
+              set -- "$@" --prod
+            fi
+            ;;
+          *)
+            echo "Error: unsupported package manager ❌"
+            exit 1
+            ;;
+        esac
+        # The version reaches the step summary; accept only the
+        # characters a release version uses
+        case "${tool_version}" in
+          ''|*[!0-9A-Za-z.+-]*)
+            echo "Error: unexpected ${tool} version string ❌"
+            exit 1 ;;
+        esac
+        echo "Auditing with ${tool} ${tool_version} 💬"
+
+        # Run the audit and capture its output regardless of the exit
+        # code; every tool exits non-zero whenever it finds
+        # vulnerabilities, and the threshold evaluation below works
+        # from the report instead. npm's report is used as is; the
+        # other tools' output is normalised into the same metadata
+        # shape. Diagnostics are kept as well: Bun reports a registry
+        # it skipped on stderr alone, and the normaliser fails on it
+        raw_output="${work_dir}/audit-output"
+        raw_errors="${work_dir}/audit-errors"
         set +e
-        npm audit "$@" > "${report_path}"
+        "$@" > "${raw_output}" 2> "${raw_errors}"
         audit_exit=$?
         set -e
-        echo "npm audit exited with code ${audit_exit}"
+        cat -- "${raw_errors}" >&2
+        echo "${tool} audit exited with code ${audit_exit}"
+        report="${work_dir}/report.json"
+        if [ "${PACKAGE_MANAGER}" = "npm" ]; then
+          cp -- "${raw_output}" "${report}"
+        else
+          jq --raw-input --slurp \
+            --arg tool "${tool}" \
+            --arg version "${tool_version}" \
+            --arg exit_code "${audit_exit}" \
+            --rawfile errors "${raw_errors}" \
+            --from-file "${ACTION_PATH}/scripts/normalise-audit.jq" \
+            "${raw_output}" > "${report}"
+        fi
+        # Publish the report in place of whatever the destination
+        # holds rather than writing through it: the default output
+        # directory is the checkout, where a planted symlink would
+        # redirect the write outside the validated directory
+        if [ -d "${report_path}" ] && [ ! -L "${report_path}" ]; then
+          echo "Error: ${report_path} is a directory ❌"
+          exit 1
+        fi
+        rm -f -- "${report_path}"
+        cp -- "${report}" "${report_path}"
 
         # Distinguish findings from tool failure: a valid report
         # carries the vulnerability metadata object; anything else
         # (network failure, registry error) fails the action outright
         if ! jq -e '.metadata.vulnerabilities | type == "object"' \
-          "${report_path}" > /dev/null 2>&1; then
-          echo "Error: npm audit did not produce a valid report ❌"
+          "${report}" > /dev/null 2>&1; then
+          echo "Error: ${tool} audit did not produce a valid report ❌"
           summary="$(jq -r '.error.summary // empty' \
-            "${report_path}" 2>/dev/null | tr -d '\r\n')"
+            "${report}" 2>/dev/null | tr -d '\r\n\033')"
           if [ -n "${summary}" ]; then
-            printf 'npm reported: %s\n' "${summary}"
+            printf '%s reported: %s\n' "${tool}" "${summary}"
           fi
           exit 1
         fi
@@ -396,19 +761,19 @@ runs:
           | map(select(.key != "total"
               and $rank[.key] != null
               and $rank[.key] >= $rank[$level]) | .value)
-          | add // 0' "${report_path}")"
+          | add // 0' "${report}")"
         total="$(jq '.metadata.vulnerabilities.total // 0' \
-          "${report_path}")"
+          "${report}")"
         critical="$(jq '.metadata.vulnerabilities.critical // 0' \
-          "${report_path}")"
+          "${report}")"
         high="$(jq '.metadata.vulnerabilities.high // 0' \
-          "${report_path}")"
+          "${report}")"
         moderate="$(jq '.metadata.vulnerabilities.moderate // 0' \
-          "${report_path}")"
+          "${report}")"
         low="$(jq '.metadata.vulnerabilities.low // 0' \
-          "${report_path}")"
+          "${report}")"
         info="$(jq '.metadata.vulnerabilities.info // 0' \
-          "${report_path}")"
+          "${report}")"
 
         if [ "${threshold_count}" = "0" ]; then
           audit_passed="true"
@@ -451,6 +816,7 @@ runs:
           echo "| Info | ${info} |"
           echo "| **Total** | **${total}** |"
           echo ""
+          echo "**Package manager:** ${tool} ${tool_version}"
           echo "**Threshold:** ${AUDIT_LEVEL} and above"
           echo "**Production dependencies only:** ${PRODUCTION_ONLY}"
           if [ "${audit_passed}" = "true" ]; then
@@ -470,11 +836,11 @@ runs:
           exit 0
         fi
         if [ "${PERMIT_FAIL}" = "true" ]; then
-          echo "::warning::npm audit found ${threshold_count}" \
+          echo "::warning::${tool} audit found ${threshold_count}" \
             "vulnerabilities at/above ${AUDIT_LEVEL};" \
             "continuing (permit_fail: true)"
           exit 0
         fi
-        echo "::error::npm audit found ${threshold_count}" \
+        echo "::error::${tool} audit found ${threshold_count}" \
           "vulnerabilities at/above ${AUDIT_LEVEL} ❌"
         exit 1

@@ -1,0 +1,12 @@
+{
+  "name": "pnpm-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.18.3",
+  "dependencies": {
+    "async": "2.6.4"
+  },
+  "devDependencies": {
+    "mkdirp": "0.5.5"
+  }
+}
