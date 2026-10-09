@@ -1,0 +1,10 @@
+{
+  "name": "node-audit-action-tools",
+  "private": true,
+  "description": "Tools the action installs to run Yarn and pnpm audits: Corepack, and a YAML parser to sanitise Yarn configuration",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "corepack": "0.34.7",
+    "yaml": "2.9.1"
+  }
+}

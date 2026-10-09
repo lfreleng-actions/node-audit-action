@@ -114,6 +114,8 @@ repos:
     rev: 57b21406f092110c18776e39b0bda50d37c945c8  # frozen: v2.4.3
     hooks:
       - id: codespell
+        # Verbatim audit output; advisory text and URLs are not ours
+        exclude: ^tests/reports/
 
   - repo: https://github.com/DetachHead/basedpyright-prek-mirror
     rev: a11caebebdbf797e1e96611123db279b334a7675  # frozen: 1.40.2
