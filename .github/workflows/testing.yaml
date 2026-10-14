@@ -509,6 +509,452 @@ jobs:
           echo "No implicit npm cache ✅"
           echo "No implicit npm cache ✅" >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test report normalisation against captured tool output ###
+  test-normaliser:
+    name: "Test: native report normalisation (captured output)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22 # v0.12.2
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # tests/reports holds stdout captured from real audits of the
+      # tests/fixtures projects, plus the empty or malformed output
+      # each tool leaves when the registry or lockfile is unusable.
+      # Failures must surface as errors, never as clean results
+      - name: "Normalise captured audit output"
+        shell: bash
+        run: |
+          # Normalise captured audit output
+          errors=0
+          # Variants of a real capture: Bun keys its report by package
+          # name, so a package called 'error' is an ordinary finding,
+          # while an entry that is not an advisory list still fails
+          derived="${RUNNER_TEMP}/derived"
+          mkdir -p "${derived}"
+          jq -c '{error: .lodash}' tests/reports/bun-findings.json \
+            > "${derived}/bun-package-named-error.json"
+          echo '{"error": "registry unavailable"}' \
+            > "${derived}/bun-error-object.json"
+          # Bun's output when a scoped registry answered its audit
+          # request with an error: a clean-looking report, exit 0,
+          # and the skip reported on stderr alone
+          cp tests/reports/bun-clean.json \
+            "${derived}/bun-skipped-registry.json"
+          printf '%s %s\n' \
+            'warn: https://registry.npmjs.org/unaudited did not answer' \
+            'the audit request (404); skipped @unaudited/pkg' \
+            > "${derived}/bun-skipped-registry.stderr"
+          # Columns: capture, tool, exit status at capture time,
+          # expected total ('error' for a tool failure). Captures come
+          # from tests/reports, or the derived variants above, with
+          # the derived stderr where there is one
+          while read -r capture tool exit_code expected; do
+            input="tests/reports/${capture}"
+            if [ -f "${derived}/${capture}" ]; then
+              input="${derived}/${capture}"
+            fi
+            stderr="${derived}/${capture%.*}.stderr"
+            if [ ! -f "${stderr}" ]; then
+              stderr=/dev/null
+            fi
+            total="$(jq --raw-input --slurp \
+              --arg tool "${tool}" \
+              --arg version "0.0.0" \
+              --arg exit_code "${exit_code}" \
+              --rawfile errors "${stderr}" \
+              --from-file scripts/normalise-audit.jq \
+              "${input}" \
+              | jq -r '.metadata.vulnerabilities.total // "error"')"
+            if [ "${total}" = "${expected}" ]; then
+              echo "${capture} (${tool}): ${total} ✅"
+            else
+              echo "${capture} (${tool}): ${total}, expected ${expected} ❌"
+              errors=1
+            fi
+          done <<'EOF'
+          yarn-classic-findings.ndjson yarn-classic 28 3
+          yarn-classic-error.ndjson yarn-classic 1 error
+          yarn-berry-findings.ndjson yarn-berry 1 2
+          yarn-berry-clean.ndjson yarn-berry 0 0
+          yarn-berry-clean.ndjson yarn-berry 1 error
+          yarn-berry-error.txt yarn-berry 1 error
+          yarn-berry-v3.json yarn-berry 1 2
+          pnpm-findings.json pnpm 1 2
+          pnpm-error.json pnpm 1 error
+          bun-findings.json bun 1 2
+          bun-clean.json bun 0 0
+          bun-error.txt bun 1 error
+          bun-package-named-error.json bun 1 1
+          bun-error-object.json bun 1 error
+          bun-skipped-registry.json bun 0 error
+          EOF
+          if [ "${errors}" != "0" ]; then
+            echo "Normalisation tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Native report normalisation verified ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test native audits for each package manager ###
+  test-package-managers:
+    name: "Test: native audit (${{ matrix.case }})"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # fixture: the project under tests/fixtures. extra: another
+        # fixture whose lockfile joins it, testing detection with
+        # several lockfiles present. package_manager: the manager
+        # detection must pick. version: the release that must run:
+        # the one the project declares in packageManager, proving
+        # Corepack honours it, the action's default, or Bun's pinned
+        # release. undeclared: drop the fixture's packageManager, so
+        # the default runs. minimum: vulnerable packages the pinned
+        # lockfile versions guarantee (lodash and minimist), counted
+        # alike for every tool.
+        # production_minimum (default 1, lodash): those a production
+        # audit must keep. hostile: plant configuration that runs
+        # code if a tool honours it
+        include:
+          - case: npm
+            fixture: npm
+            package_manager: npm
+            version: ''
+            minimum: 2
+            hostile: true
+          # The optional dependency ansi-regex 5.0.0 (high) must
+          # survive production scoping, which needs both groups
+          - case: yarn-classic
+            fixture: yarn-classic
+            package_manager: yarn
+            version: '1.22.22'
+            minimum: 3
+            production_minimum: 2
+            hostile: true
+          - case: yarn-berry
+            fixture: yarn-berry
+            package_manager: yarn
+            version: '4.10.3'
+            minimum: 2
+            hostile: true
+          - case: pnpm
+            fixture: pnpm
+            package_manager: pnpm
+            version: '10.18.3'
+            minimum: 2
+            hostile: true
+          - case: bun
+            fixture: bun
+            package_manager: bun
+            version: '1.4.2'
+            minimum: 2
+            hostile: true
+          # Nothing declared: the action's default releases run. The
+          # Berry fixture carries the lockfile format of the default
+          # release, which rejects the older one in yarn-berry
+          - case: yarn-berry default release
+            fixture: yarn-berry-default
+            package_manager: yarn
+            version: '4.18.1'
+            minimum: 2
+            hostile: false
+          - case: pnpm default release
+            fixture: pnpm
+            package_manager: pnpm
+            version: '10.34.6'
+            undeclared: true
+            minimum: 2
+            hostile: false
+          # packageManager declares pnpm, overriding npm-first order
+          - case: pnpm declared, npm lockfile too
+            fixture: pnpm
+            extra: npm
+            package_manager: pnpm
+            version: '10.18.3'
+            minimum: 2
+            hostile: false
+          # Nothing declared: npm comes first
+          - case: yarn and npm lockfiles
+            fixture: yarn-classic
+            extra: npm
+            package_manager: npm
+            version: ''
+            minimum: 2
+            hostile: false
+          # Nothing declared: Yarn comes before Bun
+          - case: bun and yarn lockfiles
+            fixture: bun
+            extra: yarn-classic
+            package_manager: yarn
+            version: '1.22.22'
+            minimum: 2
+            hostile: false
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22 # v0.12.2
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list, plus the
+      # Yarn hosts the pinned v0.5.0 list lacks: Corepack fetches
+      # Yarn classic from registry.yarnpkg.com, which also serves
+      # the audit endpoint for both Yarn lines, and Yarn Berry from
+      # repo.yarnpkg.com. Drop them once the pinned list has both
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+            registry.yarnpkg.com:443
+            repo.yarnpkg.com:443
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Each fixture's lockfile, generated by the real tool, pins
+      # lodash 4.17.20 (high) beneath async and minimist 1.2.5
+      # (critical) beneath the dev-only mkdirp, while their version
+      # ranges admit patched releases; a fresh resolution finds
+      # nothing, so findings prove the audit read the lockfile. The
+      # Yarn classic fixture also pins the optional ansi-regex 5.0.0
+      # (high) for production scoping. The files carry a .fixture
+      # suffix to keep the deliberately vulnerable lockfiles out of
+      # the dependency graph
+      - name: "Stage fixture"
+        shell: bash
+        env:
+          FIXTURE: ${{ matrix.fixture }}
+          EXTRA: ${{ matrix.extra }}
+          HOSTILE: ${{ matrix.hostile }}
+          UNDECLARED: ${{ matrix.undeclared }}
+          PACKAGE_MANAGER: ${{ matrix.package_manager }}
+        run: |
+          # Stage fixture
+          shopt -s dotglob nullglob
+          mkdir -p fixture-project
+          for source in "tests/fixtures/${FIXTURE}"/*.fixture; do
+            name="$(basename -- "${source}" .fixture)"
+            cp -- "${source}" "fixture-project/${name}"
+          done
+          if [ -n "${EXTRA}" ]; then
+            for source in "tests/fixtures/${EXTRA}"/*.fixture; do
+              name="$(basename -- "${source}" .fixture)"
+              case "${name}" in
+                package.json|.yarnrc.yml) ;;
+                *) cp -- "${source}" "fixture-project/${name}" ;;
+              esac
+            done
+          fi
+          if [ "${UNDECLARED}" = "true" ]; then
+            jq 'del(.packageManager)' fixture-project/package.json \
+              > package.json.undeclared
+            mv package.json.undeclared fixture-project/package.json
+          fi
+          # Configuration through which each tool could run code from
+          # the repository; the action must ignore all of it, so the
+          # marker file must never appear
+          if [ "${HOSTILE}" = "true" ]; then
+            evil="${RUNNER_TEMP}/evil.cjs"
+            printf '%s\n' \
+              "require('fs').appendFileSync('${RUNNER_TEMP}/code-ran'," \
+              "  process.argv.join(' ') + ';');" \
+              "module.exports = {name: 'evil', factory: () => ({})};" \
+              > "${evil}"
+            cd fixture-project
+            echo "NODE_OPTIONS=--require ${evil}" > .corepack.env
+            echo "NODE_OPTIONS=--require ${evil}" > .evil.env
+            echo "yarn-path \"${evil}\"" > .yarnrc
+            if [ -f .yarnrc.yml ]; then
+              printf '%s\n' "yarnPath: ${evil}" "plugins:" \
+                "  - ${evil}" "injectEnvironmentFiles:" \
+                "  - .evil.env" >> .yarnrc.yml
+            fi
+            # A parent .yarnrc.yml inside the workspace
+            printf '%s\n' "plugins:" "  - ${evil}" > ../.yarnrc.yml
+            # And the user's own, which Yarn Berry reads by its fixed
+            # name in the home folder
+            printf '%s\n' "plugins:" "  - ${evil}" > "${HOME}/.yarnrc.yml"
+            cp -- "${evil}" .pnpmfile.cjs
+            echo "ignorePnpmfile: false" > pnpm-workspace.yaml
+            echo "preload = [\"${evil}\"]" > bunfig.toml
+            # Writes the checkout tries to redirect onto a victim
+            # file outside it: Yarn's install state and folders, and
+            # the report itself through planted symlinks
+            victim="${RUNNER_TEMP}/victim"
+            echo "untouched" > "${victim}"
+            echo "cache-folder \"${victim}.d\"" >> .yarnrc
+            if [ -f .yarnrc.yml ]; then
+              printf '%s\n' "installStatePath: ${victim}" \
+                "cacheFolder: ${victim}.d" \
+                "globalFolder: ${victim}.d" >> .yarnrc.yml
+            fi
+            cd ..
+            for output in audit-full audit-production; do
+              mkdir -p "${output}"
+              ln -s "${victim}" \
+                "${output}/${PACKAGE_MANAGER}-audit-report.json"
+            done
+          fi
+          ls -A fixture-project
+          (cd fixture-project && find . -type f -exec sha256sum {} + \
+            | sort) > "${RUNNER_TEMP}/fixture-before.txt"
+
+      - name: "Running local action: all dependencies"
+        id: full
+        uses: $/
+        with:
+          path_prefix: fixture-project
+          audit_level: low
+          permit_fail: 'true'
+          output_directory: audit-full
+
+      - name: "Running local action: production dependencies only"
+        id: production
+        uses: $/
+        with:
+          path_prefix: fixture-project
+          audit_level: low
+          permit_fail: 'true'
+          production_only: 'true'
+          output_directory: audit-production
+
+      - name: "Verify native audit results"
+        shell: bash
+        env:
+          EXPECTED_MANAGER: ${{ matrix.package_manager }}
+          EXPECTED_VERSION: ${{ matrix.version }}
+          MINIMUM: ${{ matrix.minimum }}
+          PRODUCTION_MINIMUM: ${{ matrix.production_minimum || 1 }}
+          FULL_MANAGER: ${{ steps.full.outputs.package_manager }}
+          FULL_PASSED: ${{ steps.full.outputs.audit_passed }}
+          FULL_COUNT: ${{ steps.full.outputs.vulnerability_count }}
+          FULL_REPORT: ${{ steps.full.outputs.report_path }}
+          # yamllint disable-line rule:line-length
+          PROD_COUNT: ${{ steps.production.outputs.vulnerability_count }}
+          PROD_REPORT: ${{ steps.production.outputs.report_path }}
+        run: |
+          # Verify native audit results
+          errors=0
+          fail() {
+            echo "$1 ❌"
+            errors=1
+          }
+          if [ "${FULL_MANAGER}" != "${EXPECTED_MANAGER}" ]; then
+            fail "Detected ${FULL_MANAGER}, expected ${EXPECTED_MANAGER}"
+          fi
+          case "${FULL_REPORT}" in
+            */audit-full/"${EXPECTED_MANAGER}"-audit-report.json) ;;
+            *) fail "Unexpected report path: ${FULL_REPORT}" ;;
+          esac
+          if [ "${FULL_PASSED}" != "false" ]; then
+            fail "audit_passed=${FULL_PASSED} despite pinned advisories"
+          fi
+          for count in "${FULL_COUNT}" "${PROD_COUNT}"; do
+            case "${count}" in
+              ''|*[!0-9]*)
+                fail "Counts not numeric: ${FULL_COUNT}/${PROD_COUNT}"
+                exit 1 ;;
+            esac
+          done
+          if [ "${FULL_COUNT}" -lt "${MINIMUM}" ]; then
+            fail "Found ${FULL_COUNT}, expected at least ${MINIMUM}"
+          fi
+          report_total="$(jq '.metadata.vulnerabilities.total' \
+            "${FULL_REPORT}")"
+          if [ "${report_total}" != "${FULL_COUNT}" ]; then
+            fail "Report total ${report_total} != output ${FULL_COUNT}"
+          fi
+          report_critical="$(jq '.metadata.vulnerabilities.critical' \
+            "${FULL_REPORT}")"
+          if [ "${report_critical}" -lt 1 ]; then
+            fail "minimist 1.2.5 critical advisory missing"
+          fi
+          # Production scoping drops the dev-only minimist findings
+          # and keeps lodash, which async needs at runtime, plus any
+          # optional dependency findings
+          if [ "${PROD_COUNT}" -lt "${PRODUCTION_MINIMUM}" ] || \
+            [ "${PROD_COUNT}" -ge "${FULL_COUNT}" ]; then
+            fail "Production scoping: ${PROD_COUNT} of ${FULL_COUNT}"
+          fi
+          if ! jq -e '.metadata.vulnerabilities | type == "object"' \
+            "${PROD_REPORT}" > /dev/null; then
+            fail "Production report invalid"
+          fi
+          if [ -n "${EXPECTED_VERSION}" ]; then
+            ran="$(jq -r '.packageManagerVersion' "${FULL_REPORT}")"
+            if [ "${ran}" != "${EXPECTED_VERSION}" ]; then
+              fail "Audited with ${ran}, expected ${EXPECTED_VERSION}"
+            fi
+          fi
+          # The audit must leave the project as found: no synthesized
+          # lockfile, no install state, no packageManager auto-pin
+          if ! (cd fixture-project && find . -type f \
+            -exec sha256sum {} + | sort) \
+            | diff "${RUNNER_TEMP}/fixture-before.txt" -; then
+            fail "The audit modified the project"
+          fi
+          leftovers="$(find . -maxdepth 2 -name '.yarnrc.node-audit.*')"
+          if [ -n "${leftovers}" ]; then
+            fail "Sanitised Yarn configuration left behind: ${leftovers}"
+          fi
+          if [ -e "${RUNNER_TEMP}/code-ran" ]; then
+            fail "Project code ran: $(cat "${RUNNER_TEMP}/code-ran")"
+          fi
+          if [ -e "${RUNNER_TEMP}/victim" ]; then
+            if [ "$(cat "${RUNNER_TEMP}/victim")" != "untouched" ]; then
+              fail "A write followed the project outside it"
+            fi
+            if [ -e "${RUNNER_TEMP}/victim.d" ]; then
+              fail "Yarn wrote to a folder the project configured"
+            fi
+            for report in "${FULL_REPORT}" "${PROD_REPORT}"; do
+              if [ -L "${report}" ] || [ ! -f "${report}" ]; then
+                fail "${report} is not a regular file"
+              fi
+            done
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Native audit tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Native ${EXPECTED_MANAGER} audit verified ✅"
+          {
+            echo "Native ${EXPECTED_MANAGER} audit verified ✅"
+            echo "Findings: ${FULL_COUNT} (production: ${PROD_COUNT})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ### Test invalid inputs fail closed ###
   test-failures:
     name: "Test: invalid inputs and error handling"
@@ -588,6 +1034,84 @@ jobs:
         with:
           node_version: ''
 
+      - name: "Running local action with invalid package manager"
+        id: bad-manager
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fake-project
+          package_manager: cargo
+
+      # Native audits read the lockfile, so an explicit package
+      # manager without one must fail rather than fall back to npm
+      - name: "Running local action with missing native lockfile"
+        id: missing-lockfile
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fake-project
+          package_manager: pnpm
+
+      # A dangling lockfile symlink must not steer the npm lockfile
+      # synthesis into writing outside the project, nor may the
+      # cleanup remove a directory standing at the lockfile path
+      - name: "Plant non-regular lockfile paths"
+        shell: bash
+        run: |
+          # Plant non-regular lockfile paths
+          mkdir -p symlink-project directory-project/package-lock.json
+          cp fake-project/package.json symlink-project/
+          cp fake-project/package.json directory-project/
+          touch directory-project/package-lock.json/keep
+          ln -s "${RUNNER_TEMP}/symlink-target.json" \
+            symlink-project/package-lock.json
+
+      - name: "Running local action with dangling lockfile symlink"
+        id: dangling-lockfile
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: symlink-project
+
+      - name: "Running local action with a lockfile directory"
+        id: directory-lockfile
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: directory-project
+
+      # Bun skips a registry that answers its audit request with an
+      # error status, reporting it on stderr alone and exiting as if
+      # clean. The unknown path under the npm registry answers 404
+      - name: "Create Bun project with an unauditable registry"
+        shell: bash
+        run: |
+          # Create Bun project with an unauditable registry
+          mkdir -p bun-skipped
+          printf '%s\n' '{"name": "bun-skipped", "private": true,' \
+            '"dependencies": {"is-number": "7.0.0",' \
+            '"@unaudited/pkg": "1.0.0"}}' > bun-skipped/package.json
+          printf '%s\n' '{' '"lockfileVersion": 1,' \
+            '"workspaces": {"": {"name": "bun-skipped",' \
+            '"dependencies": {"@unaudited/pkg": "1.0.0",' \
+            '"is-number": "7.0.0"}}},' \
+            '"packages": {' \
+            '"@unaudited/pkg": ["@unaudited/pkg@1.0.0", "", {}, ""],' \
+            '"is-number": ["is-number@7.0.0", "", {}, ""]}}' \
+            > bun-skipped/bun.lock
+          printf '%s\n' '[install.scopes]' \
+            'unaudited = "https://registry.npmjs.org/unaudited/"' \
+            > bun-skipped/bunfig.toml
+
+      - name: "Running local action with an unauditable registry"
+        id: bun-skipped
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: bun-skipped
+          output_directory: bun-skipped-report
+          package_manager: bun
+
       - name: "Verify invalid inputs were rejected"
         shell: bash
         env:
@@ -597,16 +1121,42 @@ jobs:
           ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
           OUTPUT_ESCAPE_OUTCOME: ${{ steps.escape-output.outcome }}
           NO_VERSION_OUTCOME: ${{ steps.no-version.outcome }}
+          MANAGER_OUTCOME: ${{ steps.bad-manager.outcome }}
+          # yamllint disable-line rule:line-length
+          MISSING_LOCKFILE_OUTCOME: ${{ steps.missing-lockfile.outcome }}
+          # yamllint disable-line rule:line-length
+          DANGLING_LOCKFILE_OUTCOME: ${{ steps.dangling-lockfile.outcome }}
+          # yamllint disable-line rule:line-length
+          DIRECTORY_LOCKFILE_OUTCOME: ${{ steps.directory-lockfile.outcome }}
+          BUN_SKIPPED_OUTCOME: ${{ steps.bun-skipped.outcome }}
         run: |
           # Failure testing is also important; all steps MUST fail
           errors=0
+          if [ -e "${RUNNER_TEMP}/symlink-target.json" ]; then
+            echo "Lockfile synthesis wrote through a symlink ❌"
+            errors=1
+          fi
+          if [ ! -f directory-project/package-lock.json/keep ]; then
+            echo "Cleanup removed a lockfile directory ❌"
+            errors=1
+          fi
+          if ! jq -e '.error.summary | test("skipped @unaudited/pkg")' \
+            bun-skipped-report/bun-audit-report.json > /dev/null; then
+            echo "Bun report does not record the skipped registry ❌"
+            errors=1
+          fi
           for outcome_pair in \
             "audit-level:${LEVEL_OUTCOME}" \
             "boolean:${BOOL_OUTCOME}" \
             "path:${PATH_OUTCOME}" \
             "escape:${ESCAPE_OUTCOME}" \
             "output-escape:${OUTPUT_ESCAPE_OUTCOME}" \
-            "no-version:${NO_VERSION_OUTCOME}"; do
+            "no-version:${NO_VERSION_OUTCOME}" \
+            "package-manager:${MANAGER_OUTCOME}" \
+            "missing-lockfile:${MISSING_LOCKFILE_OUTCOME}" \
+            "dangling-lockfile:${DANGLING_LOCKFILE_OUTCOME}" \
+            "directory-lockfile:${DIRECTORY_LOCKFILE_OUTCOME}" \
+            "bun-skipped-registry:${BUN_SKIPPED_OUTCOME}"; do
             test_name="${outcome_pair%%:*}"
             outcome="${outcome_pair#*:}"
             if [ "${outcome}" = "success" ]; then

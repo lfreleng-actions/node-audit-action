@@ -1,0 +1,7 @@
+[31m[1mInternal Error[22m[39m: yarn-berry-fixture@workspace:.: This package doesn't seem to be present in your lockfile; run "yarn install" to update the lockfile
+    at QO.resolve (/home/runner/.cache/node/corepack/v1/yarn/4.18.1/yarn.js:206:4893)
+    at Dy.resolve (/home/runner/.cache/node/corepack/v1/yarn/4.18.1/yarn.js:143:1488)
+    at /home/runner/.cache/node/corepack/v1/yarn/4.18.1/yarn.js:211:7266
+    at Fw (/home/runner/.cache/node/corepack/v1/yarn/4.18.1/yarn.js:142:45058)
+    at $ (/home/runner/.cache/node/corepack/v1/yarn/4.18.1/yarn.js:211:7246)
+    at /home/runner/.cache/node/corepack/v1/yarn/4.18.1/yarn.js:211:7877
